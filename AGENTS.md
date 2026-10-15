@@ -11,9 +11,11 @@ breaks the persist → compact → restore loop the plugin exists to protect.
 
 A directive means context is near the persist threshold. Do, in order:
 
-1. **Persist now, in small linked units** — beads issues (`bd create/update`) or
-   files under `.opencode/context/` / `docs/research/`. Many small units, not one
-   monolith; each unit gets a slug.
+1. **Persist now, in small linked units** — in-flight state to beads
+   (`bd note <id> --stdin`, `bd create` first if no bead exists) when `bd` is
+   available, otherwise to `.opencode/context/session-notes.md`; findings to
+   `docs/research/`. Every unit gets a slug and one row in
+   `.opencode/context/index.md` pointing at its bd id or path.
 2. **End the reply with the marker** (last non-empty line, outside an unbalanced
    code fence):
    ```
@@ -26,22 +28,24 @@ A directive means context is near the persist threshold. Do, in order:
 3. **Stop after persisting.** The directive asks for stop-after-persist; do not
    start new work in the same turn.
 
-Ignoring the directive is not a escape: after a backoff, rung 2 forces a compaction
-and the summary will honestly say the persist was `UNVERIFIED`.
+Ignoring the directive is not an escape: once tokens reach the hard limit, rung 2
+forces a compaction (no time backoff) and the summary will honestly say the
+persist was not verified.
 
 ### After any compaction (the recovery contract)
 
 Your first action is always: **re-read `.opencode/context/index.md` first — it is
-the map.** Pull only the units the current task needs (`bd show <id>` / read the
-path). Your first state claim must cite a freshly read artifact, not the compaction
-summary. If the summary's last line is `PERSIST: <note>`, that note is the
+the map.** Pull only the units the current task needs (`bd show <id>` for bead rows, read the
+path for file rows). Your first state claim must cite a freshly read artifact, not the compaction
+summary. If the summary's last line is a `PERSIST:` line, that line is the
 machine-readable recovery pointer the plugin appended to the index.
 
 ### Where the text is parsed (do not reformat)
 
 - `PERSISTED: <n> units (<slugs>)` / `PERSISTED: none` — parsed from your reply
   tail by the plugin (`tool.*.input` + stop-layer handlers).
-- `PERSIST: <one-line note>` — requested via `agent.compaction_instructions`, parsed
+- `PERSIST: <YYYY-MM-DD> | <slug> | <bd id or note path> | <one-line state>` (exactly
+  four `|`-separated fields, or `PERSIST: none`) — requested via `agent.compaction_instructions`, parsed
   from the compaction summary by the `CompactionDone` handler, appended as a row to
   `.opencode/context/index.md`. Keep the init.lua instruction strings verbatim.
 - `NEXT: <one-line next action>` — captured as the continuation brief for the

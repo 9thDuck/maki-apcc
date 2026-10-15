@@ -57,8 +57,8 @@ maki.pack.add({
 
 maki.setup({
   agent = {
-    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <one-line recovery note: slugs / exact next action>' or 'PERSIST: none'.",
-    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> / read the path). Your first state claim must cite a freshly read artifact, not the summary.",
+    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <YYYY-MM-DD> | <slug> | <bd id or note path> | <one-line in-flight state / exact next action>' or 'PERSIST: none'.",
+    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> for bead rows, read the path for file rows). Your first state claim must cite a freshly read artifact, not the summary.",
   },
 })
 LUA

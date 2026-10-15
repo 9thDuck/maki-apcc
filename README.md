@@ -2,9 +2,10 @@
 
 **APCC** = **A**uto **P**ersist, **C**ompact, **C**ontinue.
 
-A plugin for [maki](https://github.com/) that saves your agent's in-flight work to
-files **before** a context compaction, compacts early (at a token level you choose),
-and gets the session going again afterwards — so a long task is less likely to lose its
+A plugin for [maki](https://github.com/tontinton/maki) that has your agent save its
+in-flight work (to [beads](https://github.com/steveyegge/beads) when `bd` is installed,
+otherwise to files) **before** a context compaction, compacts early (at a token level
+you choose), and gets the session going again afterwards — so a long task is less likely to lose its
 scope, decisions and "exact next action" to a lossy summary. It adds a durable
 record and a recovery step on top of maki's own summary; it does not replace it, and
 it can only preserve what the agent actually wrote down.
@@ -13,30 +14,40 @@ it can only preserve what the agent actually wrote down.
 in files (or in [beads](https://github.com/steveyegge/beads)). If your sessions are
 short, or you are happy with maki's built-in compaction, you do not need this.
 
-## Why it can save tokens
+## What it does, and what it does not
 
-Every turn re-sends the whole conversation as input, so what you pay for is roughly
-the *area under the context-size curve*. Left alone, a long session climbs toward the
-full window and every late turn is expensive. Compacting at a lower level (say 135k)
-keeps the curve as a low sawtooth instead. The saved notes are what make compacting
-early safe.
+What apcc adds on top of maki's own compaction:
 
-One worked example (a model, not a measurement — assumptions and full math in
-[docs/token-math.md](docs/token-math.md)): 300 turns in both cases, ~1,700 new tokens
-per turn, GLM-5.3-Flash pricing with prompt caching, a 512k window. The baseline is
-maki's own auto-compaction, which fires at the window minus a 20% buffer (~419k).
+- **Saves in-flight state first.** Near your threshold it tells the agent to write
+  where it is, what it tried and the exact next action — to beads (`bd note`) when
+  `bd` is on PATH, otherwise to `.opencode/context/session-notes.md` — and to add one
+  row per saved unit to `.opencode/context/index.md`.
+- **Checks the claim.** The agent ends that reply with `PERSISTED: <n> units (<slugs>)`.
+  apcc counts observed save-type writes (see [What counts as a save](#what-counts-as-a-save))
+  and, when it saw none, checks that every claimed slug has a row in the index.
+- **Tells the summary the truth.** The compaction summary is told whether the save was
+  verified, reported "nothing to save", or did not happen — so it carries critical
+  state itself when nothing was saved.
+- **Points recovery at the notes.** After compaction the agent is told to read the
+  index first, then `bd show <id>` (or read the path) for what it needs.
 
-| 300 turns | maki native only | with apcc (compacts at 135k) |
-|---|---|---|
-| Compactions | 1 | 4 |
-| Input tokens processed | 56.1M | 24.0M (includes compaction cost) |
-| Cost, caching on | $2.39 | $1.13 (about 53% less) |
+**On tokens, honestly:** apcc does not save tokens by itself. Compacting earlier
+saves tokens, because every turn re-sends the whole context. maki can already do
+that without apcc: set `agent.compaction_buffer` in `maki.setup` (a token count or a
+percent of the window — see [maki's configuration docs](https://maki.sh/docs/configuration)).
+In the model in [docs/token-math.md](docs/token-math.md) (300 turns, 512k window,
+GLM-5.3-Flash pricing with caching — a model, not a measurement):
 
-**When it won't help:** tasks that end before the context reaches your threshold
-(about 70 turns in this example) pay a little overhead and save nothing; if you
-already compact early by hand, you gain little beyond the saved notes. Compacting at
-135k also means compacting more often and from a smaller window of context, so the
-quality of the saved notes matters.
+| 300 turns | maki default | maki tuned to 135k | maki tuned + 12k notes re-read | apcc at 135k |
+|---|---|---|---|---|
+| Input tokens | 56.1M | 22.1M | 23.4M | 24.0M |
+| Cost, caching on | $2.39 | $1.04 | $1.10 | $1.13 |
+
+Against maki's default trigger, apcc's ~53% lower cost comes from compacting
+earlier. Against maki tuned to the same trigger, apcc costs about $0.03–0.09 more
+per task (~3–9% more input tokens): the price of the save turn and re-reading the
+notes. What you buy with that is the saved state and the honest summary, not a
+lower bill. Tasks shorter than the threshold (~70 turns here) save nothing.
 
 ## Quick start (about 5 minutes)
 
@@ -51,13 +62,14 @@ maki.pack.add({
 
 maki.setup({
   agent = {
-    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <one-line recovery note: slugs / exact next action>' or 'PERSIST: none'.",
-    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs. Your first state claim must cite a freshly read artifact, not the summary.",
+    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <YYYY-MM-DD> | <slug> | <bd id or note path> | <one-line in-flight state / exact next action>' or 'PERSIST: none'.",
+    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> for bead rows, read the path for file rows). Your first state claim must cite a freshly read artifact, not the summary.",
   },
 })
 ```
 
-Copy the two instruction strings exactly (the `PERSIST:` tail is parsed).
+Copy the two instruction strings exactly: the `PERSIST:` line is parsed and must
+have the four `|`-separated fields (date, slug, destination, state).
 If you already call `maki.setup` in your init.lua, put the two `agent` keys inside
 your existing call — `maki.setup` should appear once.
 
@@ -84,8 +96,11 @@ fixed number instead, start maki with an environment variable:
 APCC_THRESHOLD_TOKENS=135000 maki
 ```
 
-Pick a value comfortably below the point
-where maki would compact on its own.
+Pick a value comfortably below the point where maki would compact on its own. The
+plugin clamps it: the threshold never goes above maki's assumed auto-compact point
+(window minus a 20% buffer, minus 10k) minus 40k, and never below 25% of the window.
+A clamp is logged once as a warning. With the default 60% ratio this lowers the
+threshold on windows under ~250k (e.g. 129k window: ~77k becomes ~53k).
 
 **Headless (`maki -p`) note:** the idle-time compaction and automatic wake-up are
 TUI behaviours; for CI use see [Headless / CI recipe](#headless--ci-recipe).
@@ -119,18 +134,20 @@ Your notes in `.opencode/context/` are plain files and stay put.
 
 ## What it touches
 
-Writes only inside the project's `.opencode/context/` (and `docs/research/` when it
-asks the assistant to record findings), plus its state file under maki's state
-directory. While a save is pending it temporarily blocks the assistant's
-non-read tool calls until a note lands — that is the "gate". Beads (`bd`) is
-optional; without it the file notes carry the loop.
+The plugin itself writes only `.opencode/context/index.md` (the summary's `PERSIST:`
+row after a compaction) and its state file under maki's state directory. The agent,
+when asked to save, writes beads notes (`bd note` / `bd create`), index rows, and
+research under `docs/research/`; without `bd` it writes file notes under
+`.opencode/context/` instead. There is no tool "gate": at most one tool call is
+blocked, and only when the plugin cannot deliver its save prompt through
+`maki.session.prompt` — the block carries the save request instead.
 
 ---
 
 # Reference
 
 
-Persist → gate → compact → restore loop for maki. Structured persistence into
+Persist → verify → compact → restore loop for maki. Structured persistence into
 beads plus deliberate compaction at lower context levels — so summarization
 never eats the work.
 
@@ -144,9 +161,10 @@ persist    tool.*.input            persist-class writes observed (ground truth) 
 verify     agent.stop / idle       freshness-bound all-or-nothing verification of marker
                                    slugs against the context index (2-attempt retry → loud
                                    abandonment consumes the marker)
-fallback   rung 2                  directive ignored → after a backoff, forced compaction
-                                   (persist UNVERIFIED, honestly receipted); withheld while
-                                   a subagent is running
+fallback   rung 2                  directive delivered, no marker, tokens at the hard limit
+                                   → forced compaction (no time backoff; persist status
+                                   honestly receipted); NOT held back by subagents —
+                                   only the strand guard and backstop wait for them
 veto       agent.compact.before    auto-skip veto: compaction while a persist turn is
                                    pending is skipped (bounded, fail-open)
 backstop   ladder done + growing   compaction regardless, if the ladder closed and
@@ -180,20 +198,18 @@ apcc-lite attacks both halves.
 
 **Structured persistence.** Near the threshold the plugin asks — once per
 epoch — for the in-flight work to be persisted as small linked units into
-beads: notes on the task's existing beads, new issues only for genuinely new
-work, each unit with a slug, index rows in a shallow context index as the map,
-deep units as docs under `.opencode/context/`. Beads stays the durable,
-cross-session store (and is optional — without it the file channel carries the
-loop). The answer is verified honestly: freshness bounds and all-or-nothing
-slug checks, so a stale or hollow persist is reported `UNVERIFIED` out loud,
-never silently counted.
+beads: in-flight state as notes on the task's bead (`bd note`), new issues only
+for genuinely new work, each unit with a slug and an index row in a shallow
+context index as the map. Beads is optional — without it the in-flight state
+goes to `.opencode/context/session-notes.md`. See
+[What counts as a save](#what-counts-as-a-save) for exactly what is checked.
 
 **Compaction at lower context levels.** The threshold and the rung ladder make
 compaction happen early and deliberately — at a context level you chose, with
 the persist already verified — instead of at the native trigger where you take
 what the summarizer gives you. If the directive is ignored, rung 2 forces the
-compaction after a backoff and its summary says honestly whether the persist
-was verified. Native compactions that would cut a pending persist short are
+compaction once tokens reach the hard limit, and its summary says honestly
+whether the persist was verified. Native compactions that would cut a pending persist short are
 vetoed. After compaction, a machine-readable `PERSIST:` line lands in the
 index, the session wakes, and its first act is to re-read that map — recovery
 by citation of freshly read artifacts, not by trusting the summary.
@@ -210,9 +226,28 @@ compaction trigger sits far above the plugin's hard limit, so the veto is
 live-relevant only on smaller windows; compaction at native points still computes
 status honestly.
 
-State lives in `<maki state dir>/apcc_lite/state-<sanitized cwd>.json`; the loop's
-file channel is `.opencode/context/index.md` (shallow map, never contents) plus unit
-destinations (`.opencode/context/session-notes.md`, `docs/research/`).
+State lives in `<maki state dir>/apcc_lite/state-<sanitized cwd>.json`. The recovery
+map is always `.opencode/context/index.md` (shallow map, never contents); units live
+in beads (with `bd`), or `.opencode/context/session-notes.md` (without), plus
+`docs/research/` for findings.
+
+### What counts as a save
+
+Checked, and nothing more:
+
+- **Observed writes.** A tool call counts as a save if it is a shell command running
+  `bd note` / `bd create` / `bd remember` / `bd comment`, a shell command that names
+  `.opencode/context/` or `docs/research/` together with `>`, `>>`, `tee`, `sed -i`,
+  `cp` or `mv`, or a write/edit/multiedit/edit_lines tool call whose path
+  contains `.opencode/context/` or `docs/research/`. Such a write counts with **no**
+  slug or content check — a one-line write there is enough.
+- **Freshness.** The writes must happen in the current context epoch, after the save
+  request and after the last compaction.
+- **Slug check (only when no write was observed).** Every slug in the `PERSISTED:`
+  marker must have a row in the index table; 2 attempts, then the marker is dropped
+  loudly. An unreadable or missing index counts as a failed attempt.
+
+So a stale save is caught; a thin or useless note in the right place is not.
 
 **Tracking gate:** the plugin is inert unless the project is tracked — a
 `.opencode/context/` directory or a `.beads/` directory exists in the project root.
@@ -233,8 +268,8 @@ maki.pack.add({
 
 maki.setup({
   agent = {
-    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <one-line recovery note: slugs / exact next action>' or 'PERSIST: none'.",
-    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> / read the path). Your first state claim must cite a freshly read artifact, not the summary.",
+    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <YYYY-MM-DD> | <slug> | <bd id or note path> | <one-line in-flight state / exact next action>' or 'PERSIST: none'.",
+    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> for bead rows, read the path for file rows). Your first state claim must cite a freshly read artifact, not the summary.",
   },
 })
 ```
@@ -288,8 +323,8 @@ maki.pack.add({
 
 maki.setup({
   agent = {
-    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <one-line recovery note: slugs / exact next action>' or 'PERSIST: none'.",
-    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> / read the path). Your first state claim must cite a freshly read artifact, not the summary.",
+    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <YYYY-MM-DD> | <slug> | <bd id or note path> | <one-line in-flight state / exact next action>' or 'PERSIST: none'.",
+    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs (bd show <id> for bead rows, read the path for file rows). Your first state claim must cite a freshly read artifact, not the summary.",
   },
 })
 ```
@@ -324,11 +359,11 @@ init.lua, so `setup()` opts are unreachable there):
 | `APCC_BEADS`            | `true`, `false`     | (auto)  | force beads capability on/off (default: probe `bd` on PATH)      |
 | `APCC_LITE`             | `0`/`false`         | —       | disable the plugin entirely                                      |
 
-`APCC_THRESHOLD_TOKENS` overrides the derived threshold; the recommended operating
-point is an **absolute** value (`persist_trigger_tokens = 135000` in the author's
-512k-window live config) — model-independent, clamped internally so it can never
-fire past the compaction point minus headroom. Unset, the threshold derives from
-the window (`threshold_ratio` — model-dependent by nature).
+`APCC_THRESHOLD_TOKENS` overrides the derived threshold; an **absolute** value
+(e.g. 135000 on a 512k window) is model-independent. Unset, the threshold derives
+from the window (`threshold_ratio`). Either way it is clamped to (auto-compact cap −
+40k), floor 25% of the window, where the cap is window − 20% − 10k; a clamp is
+logged once via `maki.log.warn`.
 
 Vendoring (copy the file to `~/.config/maki/lua/apcc_lite.lua` and `require` it)
 unlocks the full `setup()` opts table:
@@ -338,13 +373,13 @@ unlocks the full `setup()` opts table:
 | `enabled`               | `true`         | master switch                                                           |
 | `persist_trigger_tokens`| `0` (derived)  | absolute rung-1 trigger; 0 = derive from `threshold_ratio`              |
 | `threshold_ratio`       | `0.6`          | derived threshold = ratio × context window                              |
-| `hard_limit_tokens`     | `0` (derived)  | rung-2 forced-compaction line; 0 = threshold + 40k, then **capped at `0.8·window − 10k`** so a forced compaction always wins the race against maki's native 20%-buffer auto-compact (on a 129k window: cap 93.4k; the native proactive trigger sits at ~72.9k) |
+| `hard_limit_tokens`     | `0` (derived)  | rung-2 forced-compaction line; 0 = threshold + 40k, then **capped at `0.8·window − 10k`** so a forced compaction should win the race against maki's auto-compact, assuming maki's documented default `compaction_buffer` of 20% (on a 129k window: cap 93.4k). An earlier note that maki's native trigger sits at ~72.9k there is **unverified** |
 | `post_persist`          | `"compact"`    | idle fire: compact in place, or `"fresh"` handoff (event-verified only) |
 | `beads`                 | `"auto"`       | `true` / `false` / `"auto"` (probe `bd` on PATH, memoized lazily)       |
 | `floor_tokens`          | `"auto"`       | marker floor = threshold − 1 (carry-forward below floor); `0`/`false` = kill switch; n = explicit |
 | `floor_wobble_tokens`   | `10000`        | directive-armed meter wobble band                                       |
 | `enforced_fallback`     | `true`         | rung 2 on at all (opencode default ON)                                  |
-| `nudge_backoff_ms`      | `600000`       | rung 1 → rung 2 escalation delay                                        |
+| `nudge_backoff_ms`      | `600000`       | strand-guard wait after an armed marker (rung 2 itself is token-triggered, no delay) |
 | `retry_window_ms`       | `60000`        | minimum spacing between compaction attempts paired to one marker        |
 | `attempt_cap`           | `3`            | compaction attempts paired to one marker                                |
 | `utterance_ring_max`    | `12`           | owner-utterance ring depth (memory-only)                                |
@@ -357,12 +392,15 @@ The module auto-starts on require with default/env opts; set the global
 ## Dependencies
 
 - **maki ≥ 0.6.0** — the only hard dependency.
-- **beads (`bd`) is optional.** With beads, persists go through `bd create/update`
-  and recovery references `bd show <id>` (durable, cross-session units). Install
-  beads separately ([beads](https://github.com/steveyegge/beads)) and keep it on
-  PATH. Without it, every model-facing text drops its bd mentions and the file
-  channel alone carries the loop (`.opencode/context/` files); the plugin never
-  requires and never installs beads — it degrades gracefully and logs one WARN.
+- **beads (`bd`) is optional but recommended.** With beads, in-flight state goes to
+  `bd note <id> --stdin` (or `bd create` first), each unit still gets an index row
+  pointing at its bd id, and recovery uses `bd show <id>`. Install beads separately
+  ([beads](https://github.com/steveyegge/beads)) and keep it on PATH. Without it,
+  the plugin's own save, recovery and summary texts switch to file notes
+  (`.opencode/context/session-notes.md`) and drop `bd` commands. The two init.lua
+  instruction strings above are static and still mention a bd id as one possible
+  destination. The plugin never requires or installs beads — it logs one WARN and
+  falls back.
 
 ## The marker contract
 
@@ -402,11 +440,11 @@ in the post-compaction wake and in fresh-session handoffs.
 | rung-1 directive (owned channel)  | ✓               | — (in-band denial-text fallback, stochastic perception) |
 | persist-event observation         | ✓               | ✓                                       |
 | marker capture + verification     | ✓               | ✓                                       |
-| rung-2 enforced fallback          | ✓               | ✓ (via `APCC_TEST_FIRE` seam at stop)   |
+| rung-2 enforced fallback          | ✓               | ✓ (idle chain also runs at `agent.stop`) |
 | native window-overflow compaction + veto | ✓        | ✓ (`agent.compact.before` fires)        |
 | idle fire (`/compact` on idle)    | ✓               | ✗ (dispatch fails without a UI)         |
 | owned-channel pickup of queued prompts | ✓          | ✗ (queued prompts can be lost at exit)  |
-| CompactionDone → index row → wake | ✓               | ✓ via seam; real wake needs a UI        |
+| CompactionDone → index row → wake | ✓               | index row ✓; real wake needs a UI       |
 | fresh-session handoff             | ✓               | ✗                                       |
 | pack install + entrypoint execution | ✓             | ✓ (`confirm = false`)                   |
 | first-activation approval         | ✓               | ✗ (pre-seed or run once interactively)  |
@@ -466,12 +504,13 @@ in the post-compaction wake and in fresh-session handoffs.
   `load = true` pack entrypoint does execute headless. What headless cannot do:
   answer the one-time pack permission approval, dispatch `/compact`, or guarantee
   owned-channel pickup of queued prompts.
-- Dev/test seams: `APCC_TEST_FIRE=1` (idle-chain fire at `agent.stop` — the TUI idle
-  path is unreachable headless) and `APCC_TEST_BACKOFF_MS` (compress the rung-2
-  backoff). `maki.log` timestamps are UTC.
-- `agent.compaction_buffer` is inert at runtime — both `"60%"` and numeric forms
-  are accepted by `maki.setup` but leave the native trigger unmoved. Do not rely
-  on it; the plugin's hard-limit cap math handles the race instead.
+- Dev/test seam: `APCC_TEST_BACKOFF_MS` (compress the strand-guard wait). The idle
+  chain also runs at `agent.stop`, so it is reachable headless without a seam.
+  `maki.log` timestamps are UTC.
+- `agent.compaction_buffer` (token count or percent, default `"20%"` per maki's
+  docs) is the native way to compact earlier. Whether it moves maki's trigger at
+  runtime is **untested** by this project; an earlier note here calling it inert
+  was not backed by a recorded test. The plugin's cap math assumes the 20% default.
 
 ## Verification (v9, log-receipted)
 
@@ -479,7 +518,10 @@ in the post-compaction wake and in fresh-session handoffs.
   stop-after-persist text), none-reply ladder close, rung-2 enforced fallback +
   dispatch-failure escalation queue, prohibition latch withholding rung 2, floor
   carry-forward (armed survives sub-floor idle), verification retry window,
-  backstop, fold capture — all headless-tested via the `APCC_TEST_FIRE` seam.
+  backstop, fold capture — headless-tested in v9 via a test seam that the current
+  code no longer has (the idle chain now also runs at `agent.stop`). The v0.2.x
+  fixes (/persist, classifier order, threshold clamp, error logging, index-read
+  counting) have **not** been re-run.
 - Live full cycle: nudge at threshold → persist events → armed (event-verified) →
   idle `/compact` → compaction → epoch bump → `PERSIST` row appended →
   `auto-continue: resume wake dispatched` → agent run started with `message_len: 0`

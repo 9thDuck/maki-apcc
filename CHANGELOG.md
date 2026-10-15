@@ -3,6 +3,27 @@
 All notable changes to apcc-lite are documented here. The plugin is a single-file
 maki plugin (`plugin/apcc-lite.lua`) — versions track the whole pack.
 
+## [Unreleased]
+
+### Fixed
+
+- `/persist` no longer switches off early compaction for the rest of the window.
+- "don't compact the JSON" / "never compact logs" are no longer read as a ban on
+  session compaction (foreign-object check first; Lua `|` alternation removed).
+- Threshold clamped to (auto-compact cap − 40k), floor 25% of window, logged once.
+- Swallowed handler errors are logged; an unreadable index counts as a
+  verification attempt instead of deferring forever.
+- Save prompts route in-flight state to beads when `bd` is present (file note
+  fallback), index row always. The `PERSIST:` init.lua string now asks for the
+  four-field form the parser requires (the old free-form string never parsed).
+
+### Docs
+
+- README: honest token pitch (the saving comes from compacting earlier; maki's
+  `agent.compaction_buffer` can do that too), no tool gate, rung 2 is
+  token-triggered, `APCC_TEST_FIRE` removed, exact save-check rules.
+- docs/token-math.md: tuned-maki baselines added.
+
 ## [0.2.0] — 2026-10-15
 
 Release candidate. The loop is now an opencode-faithful three-rung ladder with

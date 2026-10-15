@@ -29,11 +29,22 @@ model's window. With apcc it is compacted at a threshold you choose, so it stays
 
 ## Baselines
 
-Two baselines, because "no compaction at all" is not what maki does:
+Four baselines, because "no compaction at all" is not what maki does, and maki can
+be told to compact earlier without apcc:
 
-- **maki native** (the realistic one): auto-compaction fires at the window minus a
-  20% buffer, ~419,430 on a 524,288 window, restarting at ~15k (one compaction call
-  reads the context from cache and writes a 1.5k summary).
+- **maki default**: auto-compaction fires at the window minus a 20% buffer,
+  ~419,430 on a 524,288 window, restarting at ~15k (one compaction call reads the
+  context from cache and writes a 1.5k summary). The 20% default is from
+  [maki's configuration docs](https://maki.sh/docs/configuration)
+  (`agent.compaction_buffer`); that page does **not** say exactly when
+  auto-compaction triggers or how big the summary is, so the trigger point and the
+  1.5k summary are **inferred**, not documented.
+- **maki tuned to 135k**: the same, but `agent.compaction_buffer` set so it
+  compacts at ~135k, restarting at ~15k. Whether the setting moves maki's trigger at
+  runtime is untested here; this row assumes it does.
+- **maki tuned + same 12k notes re-read**: tuned maki, plus the same 12k of notes
+  re-read after every compaction via `post_compaction_instructions` (restart at 27k,
+  like apcc) — the closest no-plugin equivalent.
 - **Never compacts** (an upper bound only): the context climbs to 523,300.
 
 ## Without apcc — never compacts (upper bound)
@@ -78,25 +89,47 @@ Cost:
 - compaction 1.0862M × $0.04 + 0.018M × $0.50 = $0.0524
 - **Total $1.13**
 
-## Without apcc — maki native compaction
+## Without apcc — maki default compaction
 
 Same 300 turns. Context reaches 419,430 at turn ~238, compacts once, restarts at 15k.
 Total input 56.1M tokens, **$2.39** (cached) / $8.50 (no cache). Computed with the same
-script as the other two cases.
+method as the other cases.
+
+## Without apcc — maki tuned to 135k
+
+Same stretches as apcc's first one, but restarting at 15k (no notes) and with only
+the compaction call as overhead (no persist turn): 22.1M input tokens, **$1.04**
+(cached) / $3.41 (no cache). Adding the same 12k notes re-read after each
+compaction (restart at 27k): 23.4M, **$1.10** / $3.61.
 
 ## Result
 
-| 300 turns | Never compacts (bound) | maki native | With apcc |
-|---|---|---|---|
-| Compactions | 0 | 1 | 4 |
-| Input tokens processed | 80.7M | 56.1M | 24.0M |
-| Cost, caching on | $3.38 | $2.39 | $1.13 |
-| Cost, no caching | $12.20 | $8.50 | $3.69 |
+| 300 turns | Never compacts (bound) | maki default | maki tuned to 135k | maki tuned + 12k notes re-read | apcc at 135k |
+|---|---|---|---|---|---|
+| Input tokens processed | 80.7M | 56.1M | 22.1M | 23.4M | 24.0M |
+| Cost, caching on | $3.38 | $2.39 | $1.04 | $1.10 | $1.13 |
+| Cost, no caching | $12.20 | $8.50 | $3.41 | $3.61 | $3.69 |
 
-Against the realistic baseline, apcc is about **57% fewer input tokens and 53%
-cheaper**. The 67–70% figures only apply against the never-compacts upper bound.
+Said plainly:
 
-The four compactions cost about $0.05 together — small next to what they avoid.
+- **Against maki default**, apcc is about 57% fewer input tokens and ~53% cheaper.
+  That saving comes from **compacting earlier**, not from apcc as such.
+- **Against maki tuned to the same trigger**, apcc costs about **$0.03–0.09 more**
+  per 300-turn task (~3–9% more input tokens: 24.0M vs 23.4M–22.1M). That is the
+  price of the persist turn and the re-read notes.
+- Tuning the trigger alone gets you all of the saving; apcc keeps about 94% of it
+  ((56.1 − 24.0) / (56.1 − 22.1)).
+- **Below ~70 turns** (before the context first reaches 135k) there is no saving.
+- The 67–70% figures only apply against the never-compacts upper bound.
+
+**Persist break-even.** apcc's extra over tuned maki is ~1.9M tokens
+(24.0M − 22.1M), about 475k per compaction. Near the trigger a turn costs ~135k
+input, so the saved notes pay for themselves if they prevent about **3.5 wasted
+turns per compaction** (re-exploring, redoing finished work). How many they really
+prevent is **unmeasured**.
+
+This is a model: the assumptions (growth per turn, summary size, notes size,
+caching, where maki really triggers) drive the result.
 
 ## What this does not model
 
@@ -112,7 +145,7 @@ The four compactions cost about $0.05 together — small next to what they avoid
 | If… | Then |
 |---|---|
 | the task is short (ends before the threshold, ~70 turns here) | no saving; you pay the persist overhead |
-| your harness already compacts early on its own | the "without" cost drops, so the saving shrinks |
+| your harness already compacts early on its own (e.g. maki with `compaction_buffer` tuned) | the saving vanishes; apcc costs a few percent more |
 | the cache misses (idle gaps, expiry) | the "without" cost rises more, so the saving grows |
 | saved notes / re-reads are bigger than 12k | the saving shrinks a little |
 | the provider charges for cache writes | apcc, which rebuilds the cache more often, pays a bit more |
