@@ -1,10 +1,7 @@
 -- apcc_lite.lua — persist -> compact -> restore for maki, v9.
--- FAITHFUL SEMANTIC PORT of the opencode persisting-context plugin v6.9.1
--- (opencode/plugins/persisting-context.js in the opencode repo,
--- ratified directive 2026-10-12). Delivery
--- channels are maki-native (slot wrappers, autocmds); the SEMANTICS — ladder,
--- floor, owner-order parsing, marker verification, recovery contract — are the
--- opencode plugin's, owner-ratified over months.
+-- Port of an earlier opencode persisting-context plugin. Delivery channels are
+-- maki-native (slot wrappers, autocmds); the semantics — ladder, floor,
+-- owner-order parsing, marker verification, recovery contract — carry over.
 --
 --   directive Rung 1: ONE persist directive per context epoch at/after the
 --             persist threshold (opencode directiveSent). Delivered mid-turn
@@ -89,7 +86,7 @@
 -- through on any error. Kill switch: APCC_LITE=0. Test seam:
 -- APCC_TEST_BACKOFF_MS compresses the rung-2 backoff for rig tests.
 -- Token source: ctx.context_size / maki.session.read() — no transcript parsing.
--- State: <maki state dir>/apcc_lite/state-<sanitized cwd>.json (nono-allowlisted).
+-- State: <maki state dir>/apcc_lite/state-<sanitized cwd>.json.
 
 local M = {}
 
@@ -540,7 +537,7 @@ end
 
 -- /persist command text (opencode commands/persist.md, ported to maki's
 -- routing). Persist ONLY — compaction and continuation stay with the apcc
--- loop (owner directive 2026-10-12). Not [apcc]-prefixed: it is a genuine
+-- loop. Not [apcc]-prefixed: it is a genuine
 -- owner-triggered prompt and must go through the normal capture path.
 local function command_persist_text()
   return table.concat({
@@ -930,7 +927,7 @@ function M.start()
           st.markerVerifyReceipted = false
           st.markerAbandoned = false
           if st.commandPersist then
-            -- owner directive 2026-10-12: /persist is PERSIST-ONLY. The marker
+            -- /persist is PERSIST-ONLY. The marker
             -- is recorded and the rung ladder closes, but the follow-through
             -- (compaction + continuation) stays with the apcc loop. A later
             -- explicit owner compaction order verifies against this marker via
@@ -941,7 +938,7 @@ function M.start()
             st.armed = false
             st.commandPersist = false
             maki.log.info("[apcc-lite] /persist marker recorded (units=" .. tostring(marker.units)
-              .. ") — persist-only, no follow-through (owner directive 2026-10-12)")
+              .. ") — persist-only, no follow-through")
           elseif (st.persistEvents or 0) > 0 then
             st.markerOnly = false
             st.armed = true

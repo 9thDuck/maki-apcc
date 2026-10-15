@@ -1,5 +1,104 @@
 # apcc-lite
 
+A plugin for [maki](https://github.com/) that saves your agent's in-flight work to
+files **before** a context compaction, compacts early (at a token level you choose),
+and gets the session going again afterwards — so a long task doesn't lose its
+scope, decisions and "exact next action" to a lossy summary.
+
+**Who it is for:** people who run long agentic sessions in maki and keep task notes
+in files (or in [beads](https://github.com/steveyegge/beads)). If your sessions are
+short, or you are happy with maki's built-in compaction, you do not need this.
+It is a personal-workflow tool: it works for its author; there are no published
+numbers on token savings.
+
+## Quick start (about 5 minutes)
+
+Requires **maki 0.6.0 or newer** and a working default model.
+
+**1. Add this to your global `~/.config/maki/init.lua`:**
+
+```lua
+maki.pack.add({
+  { src = "https://github.com/9thDuck/maki-apcc", name = "apcc-lite", version = "v0.2.0" },
+}, { confirm = false, load = true })
+
+maki.setup({
+  agent = {
+    compaction_instructions = "[apcc] End the summary with a final line 'PERSIST: <one-line recovery note: slugs / exact next action>' or 'PERSIST: none'.",
+    post_compaction_instructions = "[apcc] Recovery: re-read .opencode/context/index.md first — it is the map. Pull only the units the current task needs. Your first state claim must cite a freshly read artifact, not the summary.",
+  },
+})
+```
+
+Copy the two instruction strings exactly (the `PERSIST:` tail is parsed).
+If you already call `maki.setup` in your init.lua, put the two `agent` keys inside
+your existing call — `maki.setup` should appear once.
+
+**2. Turn it on for a project.** The plugin does nothing in a project until that
+project has a `.opencode/context/` folder (or a `.beads/` folder). Create it
+yourself, in the project root, and keep it out of git:
+
+```sh
+mkdir -p .opencode/context
+echo ".opencode/" >> .gitignore
+```
+
+**3. Start maki once in a terminal and approve the permission prompt**
+(`Allow package apcc-lite these permissions … [y/N]` → `y`). The answer is saved;
+you are not asked again. The plugin needs the full permission set because it wraps
+maki's agent hooks; it does not need or use them for anything else.
+
+**4. Set your trigger point (optional but recommended).** By default the plugin
+acts at 60% of the model's context window — late on a large window. To pick a
+fixed number instead, start maki with an environment variable:
+
+```sh
+APCC_THRESHOLD_TOKENS=135000 maki
+```
+
+Pick a value comfortably below the point
+where maki would compact on its own.
+
+## How do I know it is working?
+
+It is quiet by design. After your first message in a project that has
+`.opencode/context/`, a state file appears:
+
+```sh
+ls ~/.local/state/maki/apcc_lite/
+```
+
+You should see a file like `state-_home_you_myproject.json` (your project path with `/` replaced by `_`). When the context crosses your
+threshold, the assistant will tell you it is saving notes and then add rows to
+`.opencode/context/index.md`; after compaction it picks the work back up on its own.
+For detail, `grep apcc-lite ~/.local/logs/maki/maki.log`.
+
+**Nothing at all?** Check, in order: maki is ≥ 0.6.0; the project has
+`.opencode/context/`; you ran maki in a terminal once and answered `y`;
+`APCC_LITE` is not set to `0`. More in [Troubleshooting](#troubleshooting).
+
+## Manual save
+
+Type `/persist` in maki to ask for a save at any time, without waiting for the threshold.
+
+## Turn it off
+
+Set `APCC_LITE=0` in the environment (per run), or remove the `pack.add` block.
+Your notes in `.opencode/context/` are plain files and stay put.
+
+## What it touches
+
+Writes only inside the project's `.opencode/context/` (and `docs/research/` when it
+asks the assistant to record findings), plus its state file under maki's state
+directory. While a save is pending it temporarily blocks the assistant's
+non-read tool calls until a note lands — that is the "gate". Beads (`bd`) is
+optional; without it the file notes carry the loop.
+
+---
+
+# Reference
+
+
 Persist → gate → compact → restore loop for maki. Structured persistence into
 beads plus deliberate compaction at lower context levels — so summarization
 never eats the work.
@@ -87,7 +186,9 @@ destinations (`.opencode/context/session-notes.md`, `docs/research/`).
 **Tracking gate:** the plugin is inert unless the project is tracked — a
 `.opencode/context/` directory or a `.beads/` directory exists in the project root.
 
-## Install
+## Install details
+
+The [Quick start](#quick-start-about-5-minutes) is enough for most people; this section explains each part and the headless/CI variant.
 
 Requires **maki ≥ 0.6.0** and a **working default model** (headless: pass
 `-m <model id>`; a maki install whose built-in default model was retired
