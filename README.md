@@ -1,5 +1,9 @@
 # apcc-lite
 
+**APCC** = **A**uto **P**ersist, **C**ompact, **C**ontinue. ("lite" because it is the
+small maki port of an earlier, larger tool; it is the complete plugin, not a cut-down
+tier.)
+
 A plugin for [maki](https://github.com/) that saves your agent's in-flight work to
 files **before** a context compaction, compacts early (at a token level you choose),
 and gets the session going again afterwards — so a long task doesn't lose its
