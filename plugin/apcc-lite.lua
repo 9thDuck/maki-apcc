@@ -471,11 +471,10 @@ end
 -- combine conservatively prohibit > compact > persist (opencode classifyUtterance).
 local function classify_utterance(text)
   local stripped = text:gsub('"[^"]*"', " ")
-  -- opencode CLAUSE_SPLIT_RE lookbehind semantics: `.`/`!`/`?` stay attached
-  -- to the clause they end, so the question guard sees a trailing "?";
-  -- `;` and em-dash are consumed as separators. (FX-006 class: the 2026-10-12
-  -- 14:45Z latch fired on "did you stop the pre compaction work?" because the
-  -- old splitter ate the "?" and the question guard never fired.)
+  -- `.`/`!`/`?` stay attached to the clause they end, so the question guard sees
+  -- a trailing "?"; `;` and em-dash are consumed as separators. (Regression
+  -- guard: a splitter that ate the "?" let "did you stop the pre compaction
+  -- work?" latch as a stop order.)
   local marked = stripped:gsub("([%.%;%!%?])%s+", "%1\n")
   marked = marked:gsub("%s*[—]%s*", "\n"):gsub("%s*;%s*", "\n")
   local rank = { prohibit = 3, compact = 2, persist = 1 }
