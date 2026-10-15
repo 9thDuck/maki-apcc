@@ -72,8 +72,9 @@ echo ".opencode/" >> .gitignore
 
 **3. Start maki once in a terminal and approve the permission prompt**
 (`Allow package apcc-lite these permissions … [y/N]` → `y`). The answer is saved;
-you are not asked again. The plugin needs the full permission set because it wraps
-maki's agent hooks; it does not need or use them for anything else.
+you are not asked again. The plugin asks for the full permission set (`fs_read`, `fs_write`, `net`, `run`,
+`env`) because maki charges that set for wrapping its agent hooks. Read
+`plugin/apcc-lite.lua` first if you want to see what it does with them.
 
 **4. Set your trigger point (optional but recommended).** By default the plugin
 acts at 60% of the model's context window — late on a large window. To pick a
@@ -85,6 +86,9 @@ APCC_THRESHOLD_TOKENS=135000 maki
 
 Pick a value comfortably below the point
 where maki would compact on its own.
+
+**Headless (`maki -p`) note:** the idle-time compaction and automatic wake-up are
+TUI behaviours; for CI use see [Headless / CI recipe](#headless--ci-recipe).
 
 ## How do I know it is working?
 
