@@ -11,8 +11,8 @@
 --             a prompt arriving mid-persist is folded and executed after
 --             compaction." There is NO nudge repetition and NO tool gate after
 --             the directive: an ignored directive escalates ONCE.
---   rung 2    ENFORCED FALLBACK: directive delivered, >= nudge_backoff_ms ago,
---             no marker, tokens still >= threshold -> forced compaction with
+--   rung 2    ENFORCED FALLBACK: directive delivered, no marker, tokens at
+--             or past the hard limit (no time backoff) -> forced compaction with
 --             NO marker verification, receipted as the data-loss tradeoff
 --             (opencode Branch B rung 2). Floor blocks it below the floor.
 --   backstop  Ladder done (escalated or closed by a none-reply) and the
@@ -57,8 +57,10 @@
 --             AND declared units == slugs == distinct; slugs-missing /
 --             count-mismatch get a 2-attempt retry window (armed-unverified,
 --             receipted once), then loud abandonment consumes the marker;
---             ambiguous/empty claims consume immediately; index-read failure
---             counts against the shared attempt budget (cap 3). Maki keeps
+--             ambiguous/empty claims consume immediately; an unreadable or
+--             missing index counts like slugs-missing (same 2-attempt window,
+--             then abandonment) so a .beads/-only project cannot defer
+--             forever. Maki keeps
 --             its EVENTS channel (observed persist-class writes) as ground
 --             truth: event-verified arms skip slug verification.
 --   contract  Every compaction gets the recovery contract (opencode
@@ -76,7 +78,10 @@
 --   modes     post_persist = "compact" (default) | "fresh" (event-verified
 --             marker fires hand off to a NEW session; maki-native owner
 --             call, kept). NEXT: line above the marker feeds the brief.
---   deps      beads (bd) optional: lazy probe; texts adapt.
+--   deps      beads (bd) optional: lazy probe; texts adapt. With bd, in-flight
+--             state goes to beads (bd note / bd create) and every unit still
+--             gets an index row pointing at it (slug + bd id); without bd the
+--             units are file notes under .opencode/context/.
 --   bounds    attempts cap 3 paired to one marker (fresh marker re-arms);
 --             compaction attempts separated by retry_window_ms; compaction
 --             pending expires after a 15-min watchdog. The wake -> persist
@@ -84,7 +89,8 @@
 --
 -- Fail-open everywhere: every entry point is pcall-wrapped and returns/pass-
 -- through on any error. Kill switch: APCC_LITE=0. Test seam:
--- APCC_TEST_BACKOFF_MS compresses the rung-2 backoff for rig tests.
+-- APCC_TEST_BACKOFF_MS compresses the strand-guard backoff for rig tests
+-- (rung 2 is token-triggered and has no backoff).
 -- Token source: ctx.context_size / maki.session.read() — no transcript parsing.
 -- State: <maki state dir>/apcc_lite/state-<sanitized cwd>.json.
 
@@ -125,6 +131,9 @@ local function probe_beads()
     caps.beads = false
   else
     local okp, resp = pcall(maki.fn.executable, "bd")
+    if not okp then
+      maki.log.warn("[apcc-lite] bd probe errored; treating bd as absent: " .. tostring(resp))
+    end
     caps.beads = (okp and resp == 1) or false
   end
   if not caps.beads then
@@ -165,6 +174,9 @@ local function load_state()
     local ok, data = pcall(maki.json.decode, text)
     if ok and type(data) == "table" and type(data.sessions) == "table" then
       state_cache = data
+    else
+      maki.log.warn("[apcc-lite] state file unreadable; starting from empty state: "
+        .. (ok and "unexpected shape" or tostring(data)))
     end
   end
   return state_cache
@@ -237,13 +249,60 @@ local function session_state(sid, t)
   return st
 end
 
+-- append one row to .opencode/context/index.md (creating dir + header if
+-- missing). A nil read is logged and the row skipped, never concatenated.
+local function append_index_row(row)
+  local idx = maki.fs.joinpath(maki.uv.cwd() or ".", ".opencode", "context", "index.md")
+  if not maki.fs.metadata(idx) then
+    maki.fs.mkdir(maki.fs.dirname(idx), { recursive = true })
+    maki.fs.atomic_write(idx,
+      "# Context index — shallow map, never contents\n\n| date | slug | destination | one-line summary |\n|---|---|---|---|\n")
+  end
+  local cur = maki.fs.read(idx)
+  if cur == nil then
+    maki.log.warn("[apcc-lite] index unreadable after create; row NOT appended: " .. row)
+    return false
+  end
+  maki.fs.atomic_write(idx, cur .. row)
+  return true
+end
+
 -- ---- decision core ----
 local function k(n) return tostring(math.floor((n or 0) / 1000)) .. "k" end
 
+-- native auto-compact cap: usable = window - compaction_buffer (assumed at
+-- maki's documented default "20%"), minus a 10k margin so our forced
+-- compaction wins the race. Shared by the threshold clamp and the hard limit.
+local function native_cap(window)
+  return window - math.floor(window * 0.2) - 10000
+end
+
+-- once-per-(raw, window) clamp receipt, memory-only
+local clamp_logged_key = nil
+
+-- threshold = explicit trigger, else ratio x window; then CLAMPED to
+-- native_cap - 40k (so rung 2 keeps its 40k band below the cap) with a sane
+-- floor of 25% of the window (tiny windows would otherwise go <= 0).
 local function resolve_threshold(window)
-  if (opts.persist_trigger_tokens or 0) > 0 then return opts.persist_trigger_tokens end
-  if (window or 0) <= 0 then return 0 end
-  return math.floor(window * opts.threshold_ratio)
+  local raw
+  if (opts.persist_trigger_tokens or 0) > 0 then
+    raw = opts.persist_trigger_tokens
+  elseif (window or 0) > 0 then
+    raw = math.floor(window * opts.threshold_ratio)
+  else
+    return 0
+  end
+  if (window or 0) <= 0 then return raw end -- no window known: cannot clamp
+  local max_t = math.max(native_cap(window) - 40000, math.floor(window * 0.25))
+  if raw <= max_t then return raw end
+  local key = tostring(raw) .. "@" .. tostring(window)
+  if clamp_logged_key ~= key then
+    clamp_logged_key = key
+    maki.log.warn("[apcc-lite] threshold ~" .. k(raw) .. " clamped to ~" .. k(max_t)
+      .. " (window ~" .. k(window) .. ": native auto-compact cap ~" .. k(native_cap(window))
+      .. " minus 40k rung-2 band, floor 25% of window)")
+  end
+  return max_t
 end
 
 -- freshness-bound persist verification: the observed writes must belong to the
@@ -265,16 +324,14 @@ local function resolve_hard_limit(window)
   local base = 0
   if (opts.hard_limit_tokens or 0) > 0 then
     base = opts.hard_limit_tokens
-  elseif (opts.persist_trigger_tokens or 0) > 0 then
-    base = opts.persist_trigger_tokens + 40000
   elseif resolve_threshold(window) > 0 then
+    -- uses the CLAMPED threshold, so an oversized persist_trigger_tokens
+    -- no longer collapses the rung-2 band to zero
     base = resolve_threshold(window) + 40000
   end
   if (window or 0) <= 0 then return base end
-  local usable = window - math.floor(window * 0.2) -- compaction_buffer default 20%
-  local cap = usable - 10000
   if base <= 0 then return 0 end
-  return math.min(base, cap)
+  return math.min(base, native_cap(window))
 end
 
 -- floor verdict (opencode floorVerdict): explicit 0/false = kill switch;
@@ -361,11 +418,50 @@ local function compact_object_session(lower_text)
   return lower_text:match("%f[%w](compact|tidy)%s+(up%s+)?(the%s+|this%s+|our%s+|a%s+)?(session|context|conversation|epoch|window|history)%f[%W]") ~= nil
 end
 
+-- foreign object: the compact word is followed (optionally via "up" and a
+-- determiner) by a noun that is not a session object, e.g. "compact the
+-- JSON", "never compact logs". Lua patterns have no `|` alternation, so this
+-- walks words explicitly. Words that are not objects (adverbs, pronouns,
+-- conjunctions) end the scan without a verdict.
+local DETERMINERS = { the = true, a = true, an = true, this = true, these = true,
+  those = true, all = true, my = true, your = true, our = true, his = true,
+  her = true, their = true, some = true, any = true }
+local NON_OBJECTS = { now = true, it = true, this = true, that = true, yet = true,
+  again = true, ever = true, anything = true, everything = true, up = true,
+  automatically = true, auto = true, early = true, please = true, here = true,
+  today = true, right = true, so = true, too = true, me = true, us = true,
+  when = true, whenever = true, ["if"] = true, unless = true, ["until"] = true,
+  once = true, after = true, before = true, ["while"] = true, at = true,
+  during = true, ["in"] = true, on = true, ["for"] = true, ["and"] = true,
+  ["or"] = true, but = true, with = true, without = true, of = true,
+  anymore = true, soon = true, later = true, first = true, ["then"] = true,
+  fully = true, asap = true, yourself = true, ["mid-task"] = true,
+  is = true, was = true, has = true, had = true, got = true, just = true,
+  ["not"] = true, as = true, to = true, from = true, by = true }
 local function compact_object_foreign(lower_text)
-  for _, _, obj in lower_text:gmatch("%f[%w](compact|tidy|compaction)%s+(the|a|an|this|these|those|all|my|your)%s+([a-z]+)") do
-    if not SESSION_OBJECTS[obj] then return true end
+  local foreign, session = false, false
+  for _, kw in ipairs(COMPACT_WORDS) do
+    local from = 1
+    while true do
+      local _, e = find_word(lower_text, kw, true, from)
+      if not e then break end
+      from = e + 1
+      local words = {}
+      for w in lower_text:sub(e + 1):match("^[%s%a'%-]*"):gmatch("[%a'%-]+") do
+        words[#words + 1] = w
+        if #words >= 4 then break end
+      end
+      local i = 1
+      if words[i] == "up" then i = i + 1 end
+      if words[i] and DETERMINERS[words[i]] then i = i + 1 end
+      local obj = words[i]
+      if obj then
+        if SESSION_OBJECTS[obj] then session = true
+        elseif not NON_OBJECTS[obj] then foreign = true end
+      end
+    end
   end
-  return false
+  return foreign and not session
 end
 
 local function past_tense_compact(lower_text)
@@ -402,9 +498,17 @@ local function casual_compact(lower_text)
     or (find_word(lower_text, "start", false) ~= nil and lower_text:match("start%s+(fresh|over)%f[%W]") ~= nil)
 end
 
+-- negator + optional auto/tidy prefix + compact; looped because Lua patterns
+-- have no `|` alternation (the old single pattern never matched)
+local PROHIBIT_LEADS = { "do%s+not", "don't", "dont", "never" }
+local PROHIBIT_PREFIXES = { "", "auto%-?", "auto%s+", "tidy%-?", "tidy%s+" }
 local function prohibit_compact(lower_text)
-  return lower_text:match("%f[%w](do%s+not|don't|dont|never)%s+(auto[-%s]?|tidy[-%s]?)?compact") ~= nil
-    or lower_text:match("%f[%w]no%s+compaction%f[%W]") ~= nil
+  for _, lead in ipairs(PROHIBIT_LEADS) do
+    for _, pre in ipairs(PROHIBIT_PREFIXES) do
+      if lower_text:match("%f[%w]" .. lead .. "%s+" .. pre .. "compact") then return true end
+    end
+  end
+  return lower_text:match("%f[%w]no%s+compaction%f[%W]") ~= nil
     or lower_text:match("%f[%w]without%s+compaction%f[%W]") ~= nil
 end
 
@@ -442,9 +546,11 @@ local function has_persist_order(lower_text)
     or find_word(lower_text, "checkpoint", false) ~= nil
 end
 
--- classify one clause (opencode classifyClause order: question, past-tense,
--- prohibition, conditional, negation, session-object, foreign-object,
--- imperative, casual; then persist order/ask).
+-- classify one clause (order: question, past-tense, foreign-object,
+-- prohibition, conditional, negation, session-object, imperative, casual;
+-- then persist order/ask). Foreign-object runs BEFORE prohibition/negation so
+-- "don't compact the JSON" / "never compact logs" are not read as a ban on
+-- session compaction (deviates from opencode's classifyClause order).
 local function classify_clause(clause)
   local c = clause:lower()
   if c:match("%?%s*$") then return nil end
@@ -452,11 +558,11 @@ local function classify_clause(clause)
   local cpos = find_compact_word(c)
   if cpos then
     if past_tense_compact(c) then return nil end
+    if compact_object_foreign(c) then return nil end
     if prohibit_compact(c) then return "prohibit" end
     if conditional_compact(c) then return nil end
     if negated_compact(c, cpos) then return "prohibit" end
     if compact_object_session(c) then return "compact" end
-    if compact_object_foreign(c) then return nil end
     if imperative_shape(c, cpos) then return "compact" end
     if casual_compact(c) then return "compact" end
     return nil
@@ -506,19 +612,31 @@ local function resolve_intent(st)
 end
 
 -- ---- texts ----
+-- Routing (owner: "write it's in flight state to beads, not files"): with bd,
+-- in-flight state goes to beads; every unit still gets an index row (the slug
+-- check reads it). Without bd, in-flight state falls back to a file note.
+local function pull_hint()
+  if probe_beads() then return " (`bd show <id>` for bead rows, read the path for file rows)" end
+  return " (read the path each row points at)"
+end
+
 local function directive_text(tokens, threshold, stop_after)
   local lines = {
     "[apcc] This session is at ~" .. k(tokens) .. " tokens (pre-compaction persist threshold ~" .. k(threshold) .. ").",
     "Before continuing the owner's request: run the persist step now — visibly, in this turn.",
-    "Persist the durable state per its routing (tracker notes first, index rows always):",
+    "Persist the durable state per its routing (in-flight state to "
+      .. (probe_beads() and "beads" or "a file note") .. ", an index row for every unit):",
   }
   if probe_beads() then
-    lines[#lines + 1] = "- progress / blocker / decision on a tracked task -> `bd note <id> --stdin`"
+    lines[#lines + 1] = "- in-flight state (where I am, tried/failed, exact next action) -> `bd note <id> --stdin` on the bead for this work (`bd create` it first if none exists)"
     lines[#lines + 1] = '- durable decision -> `bd create "Decision: <slug>" -t decision`'
   end
   lines[#lines + 1] = "- research or reusable findings -> docs/research/<topic>.md (one ## section per finding)"
-  lines[#lines + 1] = "- in-flight state (where I am, tried/failed, exact next action) -> .opencode/context/session-notes.md (newest on top)"
-  lines[#lines + 1] = "Append one line per unit to .opencode/context/index.md: `| date | slug | destination | one-line summary |` (ensure .opencode/ is gitignored first). Do not re-summarize units already persisted; point at them."
+  if not probe_beads() then
+    lines[#lines + 1] = "- in-flight state (where I am, tried/failed, exact next action) -> .opencode/context/session-notes.md (newest on top)"
+  end
+  lines[#lines + 1] = "Append one line per unit to .opencode/context/index.md: `| date | slug | destination | one-line summary |` (destination = "
+    .. (probe_beads() and "the bd id or the file path" or "the file path") .. "; ensure .opencode/ is gitignored first). Do not re-summarize units already persisted; point at them."
   lines[#lines + 1] = "If there is genuinely nothing durable to persist, do not manufacture units."
   lines[#lines + 1] = 'Either way, end this turn\'s reply with exactly one line, as its LAST line: `PERSISTED: <n> units (<slugs>)`, or `PERSISTED: none` if nothing needed saving. Optionally put `NEXT: <one-line next action>` on its own line right before the marker — it feeds the continuation brief.'
   lines[#lines + 1] = stop_after
@@ -542,7 +660,9 @@ local function command_persist_text()
   return table.concat({
     "[/persist] Execute the persist step now for this session, visibly, in this turn.",
     "Distill the conversation into durable units: in-flight state (task, where it stopped, the exact next action), decisions, gotchas, pending owner decisions. Never persist trivia, tool output, or secrets (redact).",
-    "Routing: tracker notes first (`bd note <id> --stdin`; `bd create` only for genuinely new work items), index rows always, deep units to docs under `.opencode/context/`.",
+    probe_beads()
+      and "Routing: in-flight state to beads (`bd note <id> --stdin`; `bd create` only for genuinely new work items), research to docs/research/, an index row always."
+      or "Routing: in-flight state to `.opencode/context/session-notes.md` (newest on top), research to docs/research/, an index row always.",
     "Every unit appends exactly one row to `.opencode/context/index.md` (`| date | slug | destination | one-line summary |`). The index stays shallow — a map, never contents.",
     "Do not re-summarize units that are already persisted; point at them.",
     "Do not explore, refactor, or change code. Persist, then stop.",
@@ -568,8 +688,8 @@ local function contract_text(status)
     "The authoritative recovery map is `.opencode/context/index.md`.",
     "",
     "Your summary MUST include, verbatim where possible:",
-    "- An explicit first recovery step: read `.opencode/context/index.md` before re-exploring",
-    "- Open tracker/bead IDs and any pending user decisions — reference them, do not restate their content",
+    "- An explicit first recovery step: read `.opencode/context/index.md` before re-exploring, then pull the units it points at" .. pull_hint(),
+    (probe_beads() and "- Open bead IDs" or "- Open note paths") .. " and any pending user decisions — reference them, do not restate their content",
     "- In-flight state ONLY for anything that could not be persisted",
     "",
     "Do not re-summarize units already persisted (bead notes, topic docs, session notes); point to them instead. Keep the summary short.",
@@ -585,7 +705,7 @@ local function continuation_text(state, folds, unverified)
   local lines = {
     "[apcc] Auto-resume: this session was auto-compacted and the compaction summary reports pending owner-requested work"
       .. ((state and state ~= "") and (' (pre-compaction in-flight state: "' .. state .. '").') or "."),
-    "Read .opencode/context/index.md first (the recovery map), pull only the units the task needs, and continue from the exact next action. Do not re-explore or redo completed work. If the work turns out to be resolved, say so and stop.",
+    "Read .opencode/context/index.md first (the recovery map), pull only the units the task needs" .. pull_hint() .. ", and continue from the exact next action. Do not re-explore or redo completed work. If the work turns out to be resolved, say so and stop.",
     "Your first state claim must cite a freshly read artifact.",
     "Owner directives outrank this hook: if the owner's latest instruction was to stop or wait, do NOT continue — acknowledge and stand by.",
   }
@@ -608,7 +728,7 @@ local function handoff_text(next_action)
     and ("Then continue: " .. next_action)
     or "Then continue the interrupted work (the newest index rows and the plan say where it stands)."
   return "[apcc] Fresh session continuing prior work in this project (the previous session is intact — /sessions lists it if you need history). "
-    .. "Re-read .opencode/context/index.md first (it is the map), then pull only the units the current task needs. " .. cont
+    .. "Re-read .opencode/context/index.md first (it is the map), then pull only the units the current task needs" .. pull_hint() .. ". " .. cont
     .. " Your first state claim must cite a freshly read artifact."
     .. " Owner directives outrank this hook: if the owner's latest instruction was to stop or wait, do NOT continue — acknowledge and stand by."
 end
@@ -932,12 +1052,19 @@ function M.start()
             -- explicit owner compaction order verifies against this marker via
             -- commandPersistMarkerAt (opencode OQ-2 recovery: "persist
             -- genuinely, then re-order to compact").
+            -- Early compaction must NOT be switched off for the rest of the
+            -- window: below the threshold the ladder stays open (rung 1 asks
+            -- for a fresh persist when the threshold is reached); at/over it
+            -- the ladder closes, and the backstop counts a units-closed
+            -- ladder as done, so continued growth still compacts.
             st.commandPersistMarkerAt = t
-            st.ladderClosedByUnits = true
+            local at_threshold = threshold > 0 and tokens >= threshold
+            if at_threshold then st.ladderClosedByUnits = true end
             st.armed = false
             st.commandPersist = false
             maki.log.info("[apcc-lite] /persist marker recorded (units=" .. tostring(marker.units)
-              .. ") — persist-only, no follow-through")
+              .. ") — persist-only, no follow-through; ladder "
+              .. (at_threshold and "closed (backstop still compacts on growth)" or "left open (below threshold)"))
           elseif (st.persistEvents or 0) > 0 then
             st.markerOnly = false
             st.armed = true
@@ -1131,7 +1258,7 @@ function M.start()
       local prefix = nil
       if not st.recovered and (st.epoch or 0) > 0 then
         st.recovered = true
-        prefix = "[apcc] Recovery: re-read .opencode/context/index.md first (it is the map), then pull only the units the current task needs."
+        prefix = "[apcc] Recovery: re-read .opencode/context/index.md first (it is the map), then pull only the units the current task needs" .. pull_hint() .. "."
           .. " Your first state claim must cite a freshly read artifact, not the summary."
           .. " Owner directives outrank this hook: if the owner's latest instruction was to stop or wait, do NOT resume — acknowledge and stand by.\n\n"
         maki.log.info("[apcc-lite] recovery prefix injected (epoch " .. tostring(st.epoch) .. ")")
@@ -1157,7 +1284,9 @@ function M.start()
       nv.text = prefix .. text
       return nv
     end)
-    if oku and resu then return resu end
+    if not oku then
+      maki.log.warn("[apcc-lite] user_message layer errored; failing open: " .. tostring(resu))
+    elseif resu then return resu end
     return prev(value, ctx) -- capture only unless the recovery prefix rewrites
   end)
 
@@ -1211,7 +1340,9 @@ function M.start()
       maki.log.info("[apcc-lite] compaction (" .. reason .. ") — persist status: " .. status)
       return { instructions = contract_text(status) }
     end)
-    if ok and res then return res end
+    if not ok then
+      maki.log.warn("[apcc-lite] compact.before layer errored; failing open: " .. tostring(res))
+    elseif res then return res end
     return prev(prep, ctx)
   end)
 
@@ -1221,7 +1352,7 @@ function M.start()
   -- prompts were folded mid-persist; NEVER after a manual compaction.
   maki.api.create_autocmd("CompactionDone", {
     callback = function(ev)
-      pcall(function()
+      local ok_cd, err_cd = pcall(function()
         if not enabled() then return end
         local ev_sid = ev.data and ev.data.session_id
         if ev_sid and load_state().sessions[ev_sid] == nil then
@@ -1248,33 +1379,20 @@ function M.start()
         local state_field = nil
         local unverified = false
         if parts and status == "done" then
-          local proj = maki.uv.cwd() or "."
-          local idx = maki.fs.joinpath(proj, ".opencode", "context", "index.md")
-          if not maki.fs.metadata(idx) then
-            maki.fs.mkdir(maki.fs.dirname(idx), { recursive = true })
-            maki.fs.atomic_write(idx,
-              "# Context index — shallow map, never contents\n\n| date | slug | destination | one-line summary |\n|---|---|---|---|\n")
-          end
           local row = "| " .. parts[1] .. " | " .. parts[2]:gsub("|", "\\|") .. " | "
             .. parts[3]:gsub("|", "\\|") .. " | " .. parts[4]:gsub("|", "\\|") .. " |\n"
-          maki.fs.atomic_write(idx, maki.fs.read(idx) .. row)
-          state_field = parts[4]
-          maki.log.info("[apcc-lite] summary PERSIST line appended to index (" .. parts[2] .. ")")
-        elseif parts and status == "not-done" then
-          local proj = maki.uv.cwd() or "."
-          local idx = maki.fs.joinpath(proj, ".opencode", "context", "index.md")
-          if not maki.fs.metadata(idx) then
-            maki.fs.mkdir(maki.fs.dirname(idx), { recursive = true })
-            maki.fs.atomic_write(idx,
-              "# Context index — shallow map, never contents\n\n| date | slug | destination | one-line summary |\n|---|---|---|---|\n")
+          if append_index_row(row) then
+            maki.log.info("[apcc-lite] summary PERSIST line appended to index (" .. parts[2] .. ")")
           end
+          state_field = parts[4]
+        elseif parts and status == "not-done" then
           local ts = "unknown"
           if has_time and os.date then
             ts = os.date("%Y-%m-%d %H:%M", math.floor(t / 1000))
           end
           local row = "| " .. (has_time and os.date and os.date("%Y-%m-%d", math.floor(t / 1000)) or "unknown")
             .. " | unverified | - | PERSIST: UNVERIFIED " .. ts:gsub("|", "\\|") .. " |\n"
-          maki.fs.atomic_write(idx, maki.fs.read(idx) .. row)
+          append_index_row(row)
           state_field = parts[4]
           unverified = true
           maki.log.info("[apcc-lite] persist NOT verified this epoch — UNVERIFIED row appended to index (summary PERSIST line withheld)")
@@ -1303,6 +1421,9 @@ function M.start()
           maki.log.warn("[apcc-lite] continuation wake failed (" .. tostring(errw) .. ") — will retry at idles")
         end
       end)
+      if not ok_cd then
+        maki.log.warn("[apcc-lite] CompactionDone handler errored; failing open: " .. tostring(err_cd))
+      end
     end,
   })
 
@@ -1311,10 +1432,10 @@ function M.start()
   -- retry window, attempt budget, floor (E-01 stale / carry-forward /
   -- wobble / owner exemption), fire; then Branch B rung 2 (enforced) and the
   -- backstop; plus the pending-continuation retry driver.
-  -- The chain is a function so the test seam (APCC_TEST_FIRE=1) can run it
-  -- at agent.stop in headless -p runs, where SessionStatusChanged never fires.
+  -- The chain is a function so agent.stop can also run it at turn end
+  -- (SessionStatusChanged is not reliably delivered, e.g. after /reload).
   idle_dispatch = function(sid, t)
-    pcall(function()
+    local ok_id, err_id = pcall(function()
     if not sid or not tracked() then return end
     local t = now_ms()
     local st = session_state(sid, t)
@@ -1491,19 +1612,20 @@ function M.start()
             units = st.markerUnits, slugs = st.markerSlugs, ambiguous = st.markerAmbiguous,
           })
         end
-        if not verified and reason == "index-read-failed" then
-          -- counts against the shared attempt budget (cap 3)
-          maki.log.warn("[apcc-lite] marker verification deferred: index unreadable (attempt "
-            .. tostring(st.attempts + 1) .. "/" .. tostring(opts.attempt_cap) .. ")")
-          proceed = false -- retried at the next idle via the attempt chain
-        elseif not verified then
-          -- retry window: 2 attempts, then loud abandonment consumes
+        if not verified then
+          -- retry window: 2 attempts, then loud abandonment consumes. An
+          -- unreadable/missing index counts here too (it used to defer with
+          -- no counter, so a .beads/-only project could defer forever).
           st.markerVerifyAttempts = (st.markerVerifyAttempts or 0) + 1
           if st.markerVerifyAttempts < 2 then
             if not st.markerVerifyReceipted then
               st.markerVerifyReceipted = true
               save_state()
-              maki.log.warn("[apcc-lite] marker UNVERIFIED (" .. reason .. ") — claimed units not all in the index; armed-unverified, retrying at the next idle")
+              local why = (reason == "index-read-failed")
+                and "index unreadable or missing"
+                or "claimed units not all in the index"
+              maki.log.warn("[apcc-lite] marker UNVERIFIED (" .. tostring(reason) .. ") — " .. why
+                .. "; armed-unverified, retrying at the next idle")
             end
             proceed = false
           else
@@ -1511,7 +1633,7 @@ function M.start()
             st.armed = false
             st.markerAbandoned = true
             save_state()
-            maki.log.warn("[apcc-lite] marker verification ABANDONED after 2 attempts (" .. reason .. ") — marker consumed; persist ladder re-opens")
+            maki.log.warn("[apcc-lite] marker verification ABANDONED after 2 attempts (" .. tostring(reason) .. ") — marker consumed; persist ladder re-opens")
             proceed = false
           end
         end
@@ -1607,7 +1729,9 @@ function M.start()
     -- threshold -> compact regardless of persist state (upstream).
     -- WITHHELD while subagents are in flight — unless tokens cross the hard
     -- limit, where the enforced fallback wins regardless.
-    local ladder_done = st.escalated or st.ladderClosedByNone
+    -- ladderClosedByUnits (a /persist at/over threshold) counts as done too,
+    -- so /persist never disables early compaction for the epoch
+    local ladder_done = st.escalated or st.ladderClosedByNone or st.ladderClosedByUnits
     if ladder_done and not st.compactionPending and not recently_requested
       and threshold > 0 and (st.lastTokens or 0) >= threshold
       and st.growthContinuing and (st.prohibitedAt or 0) == 0
@@ -1621,17 +1745,23 @@ function M.start()
       dispatch_compaction(st, sid, "backstop", threshold)
     end
     end)
+    if not ok_id then
+      maki.log.warn("[apcc-lite] idle chain errored; failing open: " .. tostring(err_id))
+    end
   end
 
   maki.api.create_autocmd("SessionStatusChanged", {
     callback = function(ev)
-      pcall(function()
+      local ok_ss, err_ss = pcall(function()
         local d = ev.data or {}
         if d.status == "working" then return end
         local sid = d.session_id or maki.session.current()
         if not sid then return end
         idle_dispatch(sid, now_ms())
       end)
+      if not ok_ss then
+        maki.log.warn("[apcc-lite] SessionStatusChanged handler errored; failing open: " .. tostring(err_ss))
+      end
     end,
   })
 
@@ -1641,7 +1771,7 @@ function M.start()
   -- limit still wins: at resolve_hard_limit the enforced fallback fires.
   maki.api.create_autocmd("TaskStatusChanged", {
     callback = function(ev)
-      pcall(function()
+      local ok_ts, err_ts = pcall(function()
         local d = ev.data or {}
         local sid = d.session_id or maki.session.current()
         if not sid then return end
@@ -1657,6 +1787,9 @@ function M.start()
         end
         save_state()
       end)
+      if not ok_ts then
+        maki.log.warn("[apcc-lite] TaskStatusChanged handler errored; failing open: " .. tostring(err_ts))
+      end
     end,
   })
 
