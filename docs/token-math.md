@@ -27,7 +27,16 @@ model's window. With apcc it is compacted at a threshold you choose, so it stays
 | Compaction cost (apcc) | per compaction: one extra persist turn (reads ~135.8k cached, writes 3k) + the compaction call (reads ~135.8k cached, writes a 1.5k summary) | assumption |
 | Cache-write fee | none | none listed on the pricing page |
 
-## Without apcc
+## Baselines
+
+Two baselines, because "no compaction at all" is not what maki does:
+
+- **maki native** (the realistic one): auto-compaction fires at the window minus a
+  20% buffer, ~419,430 on a 524,288 window, restarting at ~15k (one compaction call
+  reads the context from cache and writes a 1.5k summary).
+- **Never compacts** (an upper bound only): the context climbs to 523,300.
+
+## Without apcc — never compacts (upper bound)
 
 Context at turn *t* (t = 0…299) is 15,000 + 1,700·t. No compaction happens.
 
@@ -69,16 +78,34 @@ Cost:
 - compaction 1.0862M × $0.04 + 0.018M × $0.50 = $0.0524
 - **Total $1.13**
 
+## Without apcc — maki native compaction
+
+Same 300 turns. Context reaches 419,430 at turn ~238, compacts once, restarts at 15k.
+Total input 56.1M tokens, **$2.39** (cached) / $8.50 (no cache). Computed with the same
+script as the other two cases.
+
 ## Result
 
-| | Without | With apcc |
-|---|---|---|
-| Input tokens processed | 80.7M | 24.0M |
-| Average context per turn | ~269k | ~76k |
-| Cost, caching on | $3.38 | $1.13 (−67%) |
-| Cost, no caching (all input at $0.15) | $12.20 | $3.69 (−70%) |
+| 300 turns | Never compacts (bound) | maki native | With apcc |
+|---|---|---|---|
+| Compactions | 0 | 1 | 4 |
+| Input tokens processed | 80.7M | 56.1M | 24.0M |
+| Cost, caching on | $3.38 | $2.39 | $1.13 |
+| Cost, no caching | $12.20 | $8.50 | $3.69 |
+
+Against the realistic baseline, apcc is about **57% fewer input tokens and 53%
+cheaper**. The 67–70% figures only apply against the never-compacts upper bound.
 
 The four compactions cost about $0.05 together — small next to what they avoid.
+
+## What this does not model
+
+- **Quality.** It is a cost model only. It does not claim the agent works better, or
+  worse, at 135k versus 400k context, nor that early compaction loses less.
+- **Note quality.** apcc verifies that the claimed note slugs exist in
+  `.opencode/context/index.md`, not that the notes are good. Savings are only worth it
+  if the saved notes carry what the task needs after compaction.
+- Output and growth per turn are flat assumptions; real tasks vary.
 
 ## What moves the answer
 

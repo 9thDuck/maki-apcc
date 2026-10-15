@@ -4,8 +4,10 @@
 
 A plugin for [maki](https://github.com/) that saves your agent's in-flight work to
 files **before** a context compaction, compacts early (at a token level you choose),
-and gets the session going again afterwards — so a long task doesn't lose its
-scope, decisions and "exact next action" to a lossy summary.
+and gets the session going again afterwards — so a long task is less likely to lose its
+scope, decisions and "exact next action" to a lossy summary. It adds a durable
+record and a recovery step on top of maki's own summary; it does not replace it, and
+it can only preserve what the agent actually wrote down.
 
 **Who it is for:** people who run long agentic sessions in maki and keep task notes
 in files (or in [beads](https://github.com/steveyegge/beads)). If your sessions are
@@ -20,18 +22,21 @@ keeps the curve as a low sawtooth instead. The saved notes are what make compact
 early safe.
 
 One worked example (a model, not a measurement — assumptions and full math in
-[docs/token-math.md](docs/token-math.md)): 300 turns, ~1,700 new tokens per turn,
-GLM-5.3-Flash pricing with prompt caching, a 512k window.
+[docs/token-math.md](docs/token-math.md)): 300 turns in both cases, ~1,700 new tokens
+per turn, GLM-5.3-Flash pricing with prompt caching, a 512k window. The baseline is
+maki's own auto-compaction, which fires at the window minus a 20% buffer (~419k).
 
-| | Without | With apcc (compacts at 135k) |
+| 300 turns | maki native only | with apcc (compacts at 135k) |
 |---|---|---|
-| Input tokens processed | 80.7M | 24.0M (includes compaction cost) |
-| Average context per turn | ~269k | ~76k |
-| Cost, caching on | $3.38 | $1.13 (about 67% less) |
+| Compactions | 1 | 4 |
+| Input tokens processed | 56.1M | 24.0M (includes compaction cost) |
+| Cost, caching on | $2.39 | $1.13 (about 53% less) |
 
 **When it won't help:** tasks that end before the context reaches your threshold
 (about 70 turns in this example) pay a little overhead and save nothing; if you
-already compact early by hand, you gain little beyond the saved notes.
+already compact early by hand, you gain little beyond the saved notes. Compacting at
+135k also means compacting more often and from a smaller window of context, so the
+quality of the saved notes matters.
 
 ## Quick start (about 5 minutes)
 
