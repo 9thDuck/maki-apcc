@@ -10,11 +10,28 @@ scope, decisions and "exact next action" to a lossy summary.
 **Who it is for:** people who run long agentic sessions in maki and keep task notes
 in files (or in [beads](https://github.com/steveyegge/beads)). If your sessions are
 short, or you are happy with maki's built-in compaction, you do not need this.
-Why it can save tokens: every turn re-sends the whole context, so compacting at a
-lower level (e.g. 135k instead of the window limit) keeps each turn cheaper, and the
-saved notes mean you lose less when it does compact. The author reports a clear drop
-in usage-limit drain; there are no measured numbers, so treat savings as
-workload-dependent.
+
+## Why it can save tokens
+
+Every turn re-sends the whole conversation as input, so what you pay for is roughly
+the *area under the context-size curve*. Left alone, a long session climbs toward the
+full window and every late turn is expensive. Compacting at a lower level (say 135k)
+keeps the curve as a low sawtooth instead. The saved notes are what make compacting
+early safe.
+
+One worked example (a model, not a measurement — assumptions and full math in
+[docs/token-math.md](docs/token-math.md)): 300 turns, ~1,700 new tokens per turn,
+GLM-5.3-Flash pricing with prompt caching, a 512k window.
+
+| | Without | With apcc (compacts at 135k) |
+|---|---|---|
+| Input tokens processed | 80.7M | 24.0M (includes compaction cost) |
+| Average context per turn | ~269k | ~76k |
+| Cost, caching on | $3.38 | $1.13 (about 67% less) |
+
+**When it won't help:** tasks that end before the context reaches your threshold
+(about 70 turns in this example) pay a little overhead and save nothing; if you
+already compact early by hand, you gain little beyond the saved notes.
 
 ## Quick start (about 5 minutes)
 
