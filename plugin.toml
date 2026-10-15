@@ -1,0 +1,14 @@
+# apcc-lite — persist -> gate -> compact -> restore loop for maki.
+# A plugin.toml that exists defaults every permission to granted; the keys
+# below document the full grant set explicitly (maki's agent.* wrap is
+# all-or-nothing, so narrowing below this set would not change behavior:
+# the gate wraps tool.*.input and the recovery/instruction layers wrap
+# agent.* slots, which cost every permission).
+min_maki_version = "0.6.0"
+
+[permissions]
+fs_read = true
+fs_write = true
+run = true
+env = true
+net = true
