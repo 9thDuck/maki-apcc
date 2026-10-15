@@ -8,8 +8,11 @@ scope, decisions and "exact next action" to a lossy summary.
 **Who it is for:** people who run long agentic sessions in maki and keep task notes
 in files (or in [beads](https://github.com/steveyegge/beads)). If your sessions are
 short, or you are happy with maki's built-in compaction, you do not need this.
-It is a personal-workflow tool: it works for its author; there are no published
-numbers on token savings.
+Why it can save tokens: every turn re-sends the whole context, so compacting at a
+lower level (e.g. 135k instead of the window limit) keeps each turn cheaper, and the
+saved notes mean you lose less when it does compact. The author reports a clear drop
+in usage-limit drain; there are no measured numbers, so treat savings as
+workload-dependent.
 
 ## Quick start (about 5 minutes)
 
