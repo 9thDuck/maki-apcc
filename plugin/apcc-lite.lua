@@ -517,7 +517,7 @@ local function directive_text(tokens, threshold, stop_after)
     "Persist the durable state per its routing (tracker notes first, index rows always):",
   }
   if probe_beads() then
-    lines[#lines + 1] = "- progress / blocker / decision on a tracked task -> `bd note <id> --stdin`"
+    lines[#lines + 1] = "- progress / blocker / decision on a tracked task -> `bd note <id> --stdin` (REQUIRED whenever a bead is in play; session-notes.md alone is not enough)"
     lines[#lines + 1] = '- durable decision -> `bd create "Decision: <slug>" -t decision`'
   end
   lines[#lines + 1] = "- research or reusable findings -> docs/research/<topic>.md (one ## section per finding)"
@@ -753,6 +753,19 @@ local READ_TOOLS = {
   webfetch = true, code_execution = false,
 }
 local PERSIST_DEST = { [".opencode/context/"] = true, ["docs/research/"] = true }
+
+-- read-only bd commands (recovery re-reads beads with `bd show`): single simple command, no chaining/pipes/redirects/substitution
+local READ_BD_VERBS = { show = true, list = true, search = true, ready = true, blocked = true, children = true,
+  stats = true, count = true, status = true, memories = true, recall = true }
+local function is_read_bd(tool, value)
+  if tool ~= "bash" or type(value.command) ~= "string" then return false end
+  local cmd = value.command
+  if cmd:find("[;&|<>`$\n]") then return false end
+  local verb, rest = cmd:match("^%s*bd%s+(%S+)%s*(.*)$")
+  if not verb then return false end
+  if verb == "dep" then local sub = (rest .. " "):match("^(%S+)%s"); return sub == "tree" or sub == "list" end
+  return READ_BD_VERBS[verb] == true
+end
 
 local PERSIST_WRITE_TOOLS = { write = true, edit = true, multiedit = true, edit_lines = true }
 local function is_persist_write(tool, value)
@@ -1025,6 +1038,7 @@ function M.start()
       local sid = main_session(ctx)
       if not sid or not tracked() then return nil end
       if READ_TOOLS[tool] then return nil end
+      if is_read_bd(tool, value or {}) then return nil end
       if is_persist_write(tool, value or {}) then return nil end -- never block a persist attempt
       -- rung 1 net: deliver the directive ONCE via the owned channel
       -- (maki.session.prompt starts/queues a turn of our own — no tool denial,
