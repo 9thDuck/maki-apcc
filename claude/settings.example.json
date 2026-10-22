@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/apcc/apcc.mjs nudge", "timeout": 10 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/apcc/apcc.mjs nudge", "timeout": 10 }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/apcc/apcc.mjs gate", "timeout": 10 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/apcc/apcc.mjs stop", "timeout": 10 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/apcc/apcc.mjs precompact", "timeout": 10 }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/apcc/apcc.mjs restore", "timeout": 10 }] }]
+  },
+  "autoCompactWindow": 180000
+}
